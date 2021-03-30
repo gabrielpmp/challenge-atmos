@@ -45,6 +45,18 @@ static const char *TAG = "example";
 
 #define BLINK_GPIO 2
 
+void toggleLED(void * parameter){
+    while (1) {
+        printf("Turning off the LED\n");
+        gpio_set_level(BLINK_GPIO, 0);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        /* Blink on (output high) */
+	    printf("Turning on the LED\n");
+        gpio_set_level(BLINK_GPIO, 1);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {   
     esp_err_t ret;
@@ -129,17 +141,21 @@ void app_main(void)
     // Card has been initialized, print its properties
     sdmmc_card_print_info(stdout, card);
 
+    // Look for binary update file in SD card named "update.bin"
+    struct stat st;
+    if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
+        // Log if it is found
+        ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
+        // Print its size in bytes
+        printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
+    } else {
+        // Log if it is not found
+        ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
+    }
+
     gpio_pad_select_gpio(BLINK_GPIO);
     /* Set the GPIO as a push/pull output */
     gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
 
-    while (1) {
-        printf("Turning off the LED\n");
-        gpio_set_level(BLINK_GPIO, 0);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        /* Blink on (output high) */
-	    printf("Turning on the LED\n");
-        gpio_set_level(BLINK_GPIO, 1);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
+    xTaskCreate(toggleLED, "toggleLED", 1024, NULL, 1, NULL);
 }
