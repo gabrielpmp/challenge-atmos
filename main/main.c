@@ -24,6 +24,10 @@
 
 static const char *TAG = "example";
 
+#define BUFFSIZE 1024
+
+static char ota_write_data[BUFFSIZE + 1] = { 0 };
+
 #define MOUNT_POINT "/sdcard"
 
 #define USE_SPI_MODE
@@ -55,6 +59,70 @@ void toggleLED(void * parameter){
         gpio_set_level(BLINK_GPIO, 1);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
+}
+
+static void otaTask(void * parameter){
+    esp_err_t err;
+    /* update handle : set by esp_ota_begin(), must be freed via esp_ota_end() */
+    esp_ota_handle_t update_handle = 0 ;
+    const esp_partition_t *update_partition = NULL;
+
+    ESP_LOGI(TAG, "Starting OTA example");
+
+    const esp_partition_t *configured = esp_ota_get_boot_partition();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+
+    if (configured != running) {
+        ESP_LOGW(TAG, "Configured OTA boot partition at offset 0x%08x, but running from offset 0x%08x",
+                 configured->address, running->address);
+        ESP_LOGW(TAG, "(This can happen if either the OTA boot data or preferred boot image become corrupted somehow.)");
+    }
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+             running->type, running->subtype, running->address);
+
+    update_partition = esp_ota_get_next_update_partition(NULL);
+    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%x",
+             update_partition->subtype, update_partition->address);
+    assert(update_partition != NULL);
+
+    FILE* update = fopen(MOUNT_POINT"/update.bin", "rb");
+    assert(update != NULL);
+    ESP_LOGI(TAG, "Opened update file!");
+
+    // struct stat st_func;
+    // stat(MOUNT_POINT"/update.bin", &st_func);
+
+    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
+        fclose(update);
+        vTaskDelete(NULL);
+    }
+    ESP_LOGI(TAG, "esp_ota_begin succeeded");
+    
+    int data_read;
+    int binary_file_length = 0;
+
+    do {
+        /* Read file in chunks into the OTA buffer */
+        data_read = fread(ota_write_data, 1, BUFFSIZE, update);
+
+        if (data_read > 0) {
+            err = esp_ota_write( update_handle, (const void *)ota_write_data, data_read);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
+                fclose(update);
+                vTaskDelete(NULL);
+            } 
+            binary_file_length += data_read;
+            ESP_LOGI(TAG, "Written image length %d", binary_file_length);
+        }
+
+        /* Keep looping till the whole file is sent */
+    } while (data_read != 0);
+
+    fclose(update);
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
@@ -157,5 +225,6 @@ void app_main(void)
     /* Set the GPIO as a push/pull output */
     gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
 
+    xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
     xTaskCreate(toggleLED, "toggleLED", 1024, NULL, 1, NULL);
 }
