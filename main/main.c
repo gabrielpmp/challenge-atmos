@@ -102,12 +102,57 @@ static void otaTask(void * parameter){
     
     int data_read;
     int binary_file_length = 0;
+    bool image_header_was_checked = false;
 
     do {
         /* Read file in chunks into the OTA buffer */
         data_read = fread(ota_write_data, 1, BUFFSIZE, update);
 
         if (data_read > 0) {
+            if (image_header_was_checked == false) {
+                esp_app_desc_t new_app_info;
+                if (data_read > sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
+                    // check current version with downloading
+                    memcpy(&new_app_info, &ota_write_data[sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)], sizeof(esp_app_desc_t));
+                    ESP_LOGI(TAG, "New firmware version: %s", new_app_info.version);
+
+                    esp_app_desc_t running_app_info;
+                    if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
+                        ESP_LOGI(TAG, "Running firmware version: %s", running_app_info.version);
+                    }
+
+                    const esp_partition_t* last_invalid_app = esp_ota_get_last_invalid_partition();
+                    esp_app_desc_t invalid_app_info;
+                    if (esp_ota_get_partition_description(last_invalid_app, &invalid_app_info) == ESP_OK) {
+                        ESP_LOGI(TAG, "Last invalid firmware version: %s", invalid_app_info.version);
+                    }
+
+                    // check current version with last invalid partition
+                    if (last_invalid_app != NULL) {
+                        if (memcmp(invalid_app_info.version, new_app_info.version, sizeof(new_app_info.version)) == 0) {
+                            ESP_LOGW(TAG, "New version is the same as invalid version.");
+                            ESP_LOGW(TAG, "Previously, there was an attempt to launch the firmware with %s version, but it failed.", invalid_app_info.version);
+                            ESP_LOGW(TAG, "The firmware has been rolled back to the previous version.");
+                            fclose(update);
+                            vTaskDelete(NULL);
+                        }
+                    }
+#ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
+                    if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0) {
+                        ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
+                        fclose(update);
+                        vTaskDelete(NULL);
+                    }
+#endif
+
+                    image_header_was_checked = true;
+
+                } else {
+                    ESP_LOGE(TAG, "received package is not fit len");
+                    fclose(update);
+                    vTaskDelete(NULL);
+                }
+            }
             err = esp_ota_write( update_handle, (const void *)ota_write_data, data_read);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
@@ -118,7 +163,7 @@ static void otaTask(void * parameter){
             ESP_LOGI(TAG, "Written image length %d", binary_file_length);
         }
 
-        /* Keep looping till the whole file is sent */
+    /* Keep looping till the whole file is sent */
     } while (data_read != 0);
 
     fclose(update);
