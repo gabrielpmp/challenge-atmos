@@ -166,8 +166,27 @@ static void otaTask(void * parameter){
     /* Keep looping till the whole file is sent */
     } while (data_read != 0);
 
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+            ESP_LOGE(TAG, "Image validation failed, image is corrupted");
+        }
+        ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
+        fclose(update);
+        vTaskDelete(NULL);
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
+        fclose(update);
+        vTaskDelete(NULL);
+    }
+
     fclose(update);
-    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "Prepare to restart system!");
+    esp_restart();
+    return ;
 }
 
 void app_main(void)
@@ -264,6 +283,29 @@ void app_main(void)
     } else {
         // Log if it is not found
         ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
+    }
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    struct stat st_main;
+
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            // run diagnostic function ...
+            bool diagnostic_is_ok = true;
+            if (diagnostic_is_ok) {
+                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
+                esp_ota_mark_app_valid_cancel_rollback();
+                if (stat(MOUNT_POINT"/update.bin", &st_main) == 0) {
+                    ESP_LOGI(TAG, "Removing previous update ...");
+                    // Delete it if it exists
+                    unlink(MOUNT_POINT"/update.bin");
+                }
+            } else {
+                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            } 
+        }
     }
 
     gpio_pad_select_gpio(BLINK_GPIO);
