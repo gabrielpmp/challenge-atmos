@@ -2,6 +2,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include "esp_err.h"
@@ -28,7 +29,12 @@ static const char *TAG = "example";
 
 static char ota_write_data[BUFFSIZE + 1] = { 0 };
 
+static xQueueHandle gpio_evt_queue = NULL;
+
 #define MOUNT_POINT "/sdcard"
+sdmmc_card_t* card;
+const char mount_point[] = MOUNT_POINT;
+sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 
 #define USE_SPI_MODE
 
@@ -47,10 +53,115 @@ static char ota_write_data[BUFFSIZE + 1] = { 0 };
 #define PIN_NUM_CS   5
 #endif //USE_SPI_MODE
 
-#define BLINK_GPIO 2
+// Card Detect and Write Protect pins used in the SD card
+#define PIN_NUM_CD   25
+#define PIN_NUM_WP   26
+#define ESP_INTR_FLAG_DEFAULT 0
+
+#define BLINK_GPIO   2
+#define CONFIG_EXAMPLE_SKIP_VERSION_CHECK
+
+volatile int is_sd_present;
+
+static void IRAM_ATTR gpio_isr_handler(void* arg){
+    uint32_t gpio_num = (uint32_t) arg;
+    is_sd_present = !gpio_get_level(gpio_num);
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+int start_sd_card(){
+    esp_err_t ret;
+    // Options for mounting the filesystem.
+    // If format_if_mount_failed is set to true, SD card will be partitioned and
+    // formatted in case when mounting fails.
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+#ifdef CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
+        .format_if_mount_failed = true,
+#else
+        .format_if_mount_failed = false,
+#endif // EXAMPLE_FORMAT_IF_MOUNT_FAILED
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    //Moved to global
+    //sdmmc_card_t* card;
+    //const char mount_point[] = MOUNT_POINT;
+    ESP_LOGI(TAG, "Initializing SD card");
+
+#ifndef USE_SPI_MODE
+    ESP_LOGI(TAG, "Using SDMMC peripheral");
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+
+    // To use 1-line SD mode, uncomment the following line:
+    // slot_config.width = 1;
+
+    // GPIOs 15, 2, 4, 12, 13 should have external 10k pull-ups.
+    // Internal pull-ups are not sufficient. However, enabling internal pull-ups
+    // does make a difference some boards, so we do that here.
+    gpio_set_pull_mode(15, GPIO_PULLUP_ONLY);   // CMD, needed in 4- and 1- line modes
+    gpio_set_pull_mode(2, GPIO_PULLUP_ONLY);    // D0, needed in 4- and 1-line modes
+    gpio_set_pull_mode(4, GPIO_PULLUP_ONLY);    // D1, needed in 4-line mode only
+    gpio_set_pull_mode(12, GPIO_PULLUP_ONLY);   // D2, needed in 4-line mode only
+    gpio_set_pull_mode(13, GPIO_PULLUP_ONLY);   // D3, needed in 4- and 1-line modes
+
+    ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+#else
+    ESP_LOGI(TAG, "Using SPI peripheral");
+
+    // Declaration moved to global
+    //sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    // Reduce default speed due to peripheral limitations
+    host.max_freq_khz = 8000;
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return 0;
+    }
+
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    // Set CD and WP pins
+    slot_config.gpio_cd = PIN_NUM_CD;
+    slot_config.gpio_wp = SDSPI_SLOT_NO_WP;
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = host.slot;
+
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+#endif //USE_SPI_MODE
+
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount filesystem. "
+                "If you want the card to be formatted, set the EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+            return 0;
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
+                "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+            return 0;
+        }
+        return 0;
+    }
+
+    // Card has been initialized, print its properties
+    sdmmc_card_print_info(stdout, card);
+    return 1;
+}
 
 void toggleLED(void * parameter){
     while (1) {
+        printf("SD present: %u\n", is_sd_present);
         printf("Turning off the LED\n");
         gpio_set_level(BLINK_GPIO, 0);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -184,6 +295,13 @@ static void otaTask(void * parameter){
     }
 
     fclose(update);
+    ESP_LOGI(TAG, "Done! Unmounting ...");
+    esp_vfs_fat_sdcard_unmount(mount_point, card);
+    ESP_LOGI(TAG, "Card unmounted");
+#ifdef USE_SPI_MODE
+    //deinitialize the bus after all devices are removed
+    spi_bus_free(host.slot);
+#endif
     ESP_LOGI(TAG, "Prepare to restart system!");
     esp_restart();
     return ;
@@ -191,103 +309,70 @@ static void otaTask(void * parameter){
 
 void app_main(void)
 {   
-    esp_err_t ret;
-    // Options for mounting the filesystem.
-    // If format_if_mount_failed is set to true, SD card will be partitioned and
-    // formatted in case when mounting fails.
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-#ifdef CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED
-        .format_if_mount_failed = true,
-#else
-        .format_if_mount_failed = false,
-#endif // EXAMPLE_FORMAT_IF_MOUNT_FAILED
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024
-    };
-    sdmmc_card_t* card;
-    const char mount_point[] = MOUNT_POINT;
-    ESP_LOGI(TAG, "Initializing SD card");
+    gpio_config_t io_conf;
 
-#ifndef USE_SPI_MODE
-    ESP_LOGI(TAG, "Using SDMMC peripheral");
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    //interrupt of both edges
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    //bit mask of the CD pin
+    io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
+    //set as input mode    
+    io_conf.mode = GPIO_MODE_INPUT;
+    //enable pull-up mode
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+    gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+    //install gpio isr service
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
 
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-
-    // To use 1-line SD mode, uncomment the following line:
-    // slot_config.width = 1;
-
-    // GPIOs 15, 2, 4, 12, 13 should have external 10k pull-ups.
-    // Internal pull-ups are not sufficient. However, enabling internal pull-ups
-    // does make a difference some boards, so we do that here.
-    gpio_set_pull_mode(15, GPIO_PULLUP_ONLY);   // CMD, needed in 4- and 1- line modes
-    gpio_set_pull_mode(2, GPIO_PULLUP_ONLY);    // D0, needed in 4- and 1-line modes
-    gpio_set_pull_mode(4, GPIO_PULLUP_ONLY);    // D1, needed in 4-line mode only
-    gpio_set_pull_mode(12, GPIO_PULLUP_ONLY);   // D2, needed in 4-line mode only
-    gpio_set_pull_mode(13, GPIO_PULLUP_ONLY);   // D3, needed in 4- and 1-line modes
-
-    ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
-#else
-    ESP_LOGI(TAG, "Using SPI peripheral");
-
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    // Reduce default speed due to peripheral limitations
-    host.max_freq_khz = 8000;
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize bus.");
-        return;
+    int is_sd_card_mounted = false;
+    if(gpio_get_level(PIN_NUM_CD) == 0){
+        is_sd_present = true;
+        ESP_LOGI(TAG, "SD CARD FOUND!");
+        ESP_LOGI(TAG, "MOUNTING ...");
+        is_sd_card_mounted = start_sd_card();
+        // Readds the ISR routine (PIN reconfigured)
+        io_conf.intr_type = GPIO_INTR_ANYEDGE;
+        io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
+        //set as input mode    
+        io_conf.mode = GPIO_MODE_INPUT;
+        //enable pull-up mode
+        io_conf.pull_up_en = 1;
+        gpio_config(&io_conf);
+        gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+        gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
     }
 
-    // TDB!!!!!
-    // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
-    slot_config.host_id = host.slot;
+    //create a queue to handle gpio event from isr
+    gpio_evt_queue = xQueueCreate(1, sizeof(uint32_t));
 
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
-#endif //USE_SPI_MODE
-
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem. "
-                "If you want the card to be formatted, set the EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-        }
-        return;
-    }
-
-    // Card has been initialized, print its properties
-    sdmmc_card_print_info(stdout, card);
-
-    // Look for binary update file in SD card named "update.bin"
-    struct stat st;
-    if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
-        // Log if it is found
-        ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
-        // Print its size in bytes
-        printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
-    } else {
-        // Log if it is not found
-        ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
-    }
+    //hook isr handler for specific gpio pin
+    gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
 
     const esp_partition_t *running = esp_ota_get_running_partition();
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+             running->type, running->subtype, running->address);
+
     esp_ota_img_states_t ota_state;
-    struct stat st_main;
+
+    // if(sd_status){
+    //     ESP_LOGI(TAG, "SD CARD STARTED!");
+    //     // Look for binary update file in SD card named "update.bin"
+    //     struct stat st;
+    //     if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
+    //         // Log if it is found
+    //         ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
+    //         // Print its size in bytes
+    //         printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
+    //     } else {
+    //         // Log if it is not found
+    //         ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
+    //     }
+    // } else {
+    //     ESP_LOGE(TAG, "SD CARD FAILED!");
+    // }
+
+    struct stat st;
+    int cleanup_update = false;
 
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
@@ -296,10 +381,9 @@ void app_main(void)
             if (diagnostic_is_ok) {
                 ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
                 esp_ota_mark_app_valid_cancel_rollback();
-                if (stat(MOUNT_POINT"/update.bin", &st_main) == 0) {
+                if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
                     ESP_LOGI(TAG, "Removing previous update ...");
-                    // Delete it if it exists
-                    unlink(MOUNT_POINT"/update.bin");
+                    cleanup_update = true;
                 }
             } else {
                 ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
@@ -308,10 +392,58 @@ void app_main(void)
         }
     }
 
+    if(cleanup_update){
+        unlink(MOUNT_POINT"/update.bin");
+        ESP_LOGI(TAG, "Removing done!");
+        cleanup_update = false;
+    }
+
     gpio_pad_select_gpio(BLINK_GPIO);
     /* Set the GPIO as a push/pull output */
     gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
 
-    xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
-    xTaskCreate(toggleLED, "toggleLED", 1024, NULL, 1, NULL);
+    //xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
+    xTaskCreate(toggleLED, "toggleLED", 2048, NULL, 1, NULL);
+
+    while (1){
+        if(is_sd_present && !is_sd_card_mounted){
+            ESP_LOGI(TAG, "SD CARD FOUND!");
+            ESP_LOGI(TAG, "MOUNTING ...");
+            is_sd_card_mounted = start_sd_card();
+            // Readds the ISR routine (PIN reconfigured)
+            io_conf.intr_type = GPIO_INTR_ANYEDGE;
+            io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
+            //set as input mode    
+            io_conf.mode = GPIO_MODE_INPUT;
+            //enable pull-up mode
+            io_conf.pull_up_en = 1;
+            gpio_config(&io_conf);
+            gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+            gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
+        } else if (!is_sd_present && is_sd_card_mounted){
+            ESP_LOGE(TAG, "SD CARD REMOVED!");
+            ESP_LOGE(TAG, "UNMOUNTING ...");
+            esp_vfs_fat_sdcard_unmount(mount_point, card);
+            ESP_LOGI(TAG, "Card unmounted");
+#ifdef USE_SPI_MODE
+            //deinitialize the bus after all devices are removed
+            spi_bus_free(host.slot);
+#endif
+        } else if(is_sd_present && is_sd_card_mounted){
+            if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
+                // Log if it is found
+                ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
+                // Print its size in bytes
+                printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
+                ESP_LOGI(TAG, "STARTING UPDATE PROCESS ...");
+                xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
+                return;
+            } else {
+                // Log if it is not found
+                ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
+            }
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+    
 }
