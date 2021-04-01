@@ -60,6 +60,7 @@ bool is_spi_started = false;
 #define ESP_INTR_FLAG_DEFAULT 0
 
 #define BLINK_GPIO   2
+#define BUTTON_GPIO  4
 #define CONFIG_EXAMPLE_SKIP_VERSION_CHECK
 
 volatile int is_sd_present = false;
@@ -156,9 +157,6 @@ int start_sd_card(){
 
     // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    // Set CD and WP pins
-    slot_config.gpio_cd = PIN_NUM_CD;
-    slot_config.gpio_wp = SDSPI_SLOT_NO_WP;
     slot_config.gpio_cs = PIN_NUM_CS;
     slot_config.host_id = host.slot;
 
@@ -181,6 +179,24 @@ int start_sd_card(){
     // Card has been initialized, print its properties
     sdmmc_card_print_info(stdout, card);
     return 1;
+}
+
+static bool diagnostic(void){
+    gpio_config_t io_conf;
+    io_conf.intr_type    = GPIO_PIN_INTR_DISABLE;
+    io_conf.mode         = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << BUTTON_GPIO);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    ESP_LOGI(TAG, "Diagnostics (5 sec)...");
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    bool diagnostic_is_ok = gpio_get_level(BUTTON_GPIO);
+
+    gpio_reset_pin(BUTTON_GPIO);
+    return diagnostic_is_ok;
 }
 
 void toggleLED(void * parameter){
@@ -355,7 +371,6 @@ static void otaTask(void * parameter){
 
 static void sdhandleTask(void * parameter){
     struct stat st_sd;
-    gpio_config_t io_conf;
     while (1){
         if(is_sd_present && !is_sd_card_mounted){
             // If the SD card is present and has not been mounted, try to mount it
@@ -365,16 +380,6 @@ static void sdhandleTask(void * parameter){
                 start_spi_bus();
             }
             is_sd_card_mounted = start_sd_card();
-            // Readds the ISR routine (PIN reconfigured)
-            io_conf.intr_type = GPIO_INTR_ANYEDGE;
-            io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
-            //set as input mode    
-            io_conf.mode = GPIO_MODE_INPUT;
-            //enable pull-up mode
-            io_conf.pull_up_en = 1;
-            gpio_config(&io_conf);
-            gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
-            gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
         } else if (!is_sd_present && is_sd_card_mounted){
             // If the SD card is removed and is still mounted, unmount it
             ESP_LOGE(TAG, "SD CARD REMOVED!");
@@ -387,16 +392,6 @@ static void sdhandleTask(void * parameter){
             spi_bus_free(host.slot);
             is_spi_started = false;
 #endif
-             // Readds the ISR routine (PIN reconfigured)
-            io_conf.intr_type = GPIO_INTR_ANYEDGE;
-            io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
-            //set as input mode    
-            io_conf.mode = GPIO_MODE_INPUT;
-            //enable pull-up mode
-            io_conf.pull_up_en = 1;
-            gpio_config(&io_conf);
-            gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
-            gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
         } else if(is_sd_present && is_sd_card_mounted){
             // If the SD card is present and mounted, look for update file
             if (stat(MOUNT_POINT"/update.bin", &st_sd) == 0) {
@@ -446,17 +441,6 @@ void app_main(void)
             start_spi_bus();
         }
         is_sd_card_mounted = start_sd_card();
-        ESP_LOGI(TAG, "REATACHING ISR ...");
-        // Readds the ISR routine (PIN reconfigured)
-        io_conf.intr_type = GPIO_INTR_ANYEDGE;
-        io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
-        //set as input mode    
-        io_conf.mode = GPIO_MODE_INPUT;
-        //enable pull-up mode
-        io_conf.pull_up_en = 1;
-        gpio_config(&io_conf);
-        gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
-        gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
     }
 
     //gpio_set_intr_type(PIN_NUM_CD, GPIO_INTR_ANYEDGE);
@@ -477,7 +461,7 @@ void app_main(void)
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
             // Test image to check if working properly
             // TBD!!!!
-            bool diagnostic_is_ok = true;
+            bool diagnostic_is_ok = diagnostic();
             if (diagnostic_is_ok) {
                 ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
                 esp_ota_mark_app_valid_cancel_rollback();
@@ -505,7 +489,7 @@ void app_main(void)
     // Set GPIO to blink LED as output
     gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
     // Create blink LED task
-    //xTaskCreate(toggleLED, "toggleLED", 2048, NULL, 1, NULL);
+    // xTaskCreate(toggleLED, "toggleLED", 2048, NULL, 1, NULL);
     xTaskCreate(sdhandleTask, "sdhandleTask", 8192, NULL, 1, &mainTaskHandle);
     // Loop from the main task
 //     while (1){
