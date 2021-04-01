@@ -2,7 +2,6 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include "esp_err.h"
@@ -23,18 +22,20 @@
 #include "driver/sdmmc_host.h"
 #endif
 
+TaskHandle_t mainTaskHandle = NULL;
+TaskHandle_t otaTaskHandle = NULL;
+
 static const char *TAG = "example";
 
 #define BUFFSIZE 1024
 
 static char ota_write_data[BUFFSIZE + 1] = { 0 };
 
-static xQueueHandle gpio_evt_queue = NULL;
-
 #define MOUNT_POINT "/sdcard"
 sdmmc_card_t* card;
 const char mount_point[] = MOUNT_POINT;
 sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+bool is_spi_started = false;
 
 #define USE_SPI_MODE
 
@@ -61,12 +62,35 @@ sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 #define BLINK_GPIO   2
 #define CONFIG_EXAMPLE_SKIP_VERSION_CHECK
 
-volatile int is_sd_present;
+volatile int is_sd_present = false;
+// Flag to detect SD card mounting status
+int is_sd_card_mounted = false;
 
 static void IRAM_ATTR gpio_isr_handler(void* arg){
     uint32_t gpio_num = (uint32_t) arg;
     is_sd_present = !gpio_get_level(gpio_num);
-    xQueueSendFromISR(gpio_evt_queue, &gpio_num, NULL);
+}
+
+void start_spi_bus(){
+    //sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    // Reduce default speed due to peripheral limitations
+    esp_err_t ret;
+    host.max_freq_khz = 8000;
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return;
+    }
+    is_spi_started = true;
+    return;
 }
 
 int start_sd_card(){
@@ -113,22 +137,22 @@ int start_sd_card(){
     ESP_LOGI(TAG, "Using SPI peripheral");
 
     // Declaration moved to global
-    //sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    // Reduce default speed due to peripheral limitations
-    host.max_freq_khz = 8000;
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-    ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize bus.");
-        return 0;
-    }
+    // //sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    // // Reduce default speed due to peripheral limitations
+    // host.max_freq_khz = 8000;
+    // spi_bus_config_t bus_cfg = {
+    //     .mosi_io_num = PIN_NUM_MOSI,
+    //     .miso_io_num = PIN_NUM_MISO,
+    //     .sclk_io_num = PIN_NUM_CLK,
+    //     .quadwp_io_num = -1,
+    //     .quadhd_io_num = -1,
+    //     .max_transfer_sz = 4000,
+    // };
+    // ret = spi_bus_initialize(host.slot, &bus_cfg, SPI_DMA_CHAN);
+    // if (ret != ESP_OK) {
+    //     ESP_LOGE(TAG, "Failed to initialize bus.");
+    //     return 0;
+    // }
 
     // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
@@ -200,17 +224,18 @@ static void otaTask(void * parameter){
     assert(update != NULL);
     ESP_LOGI(TAG, "Opened update file!");
 
-    // struct stat st_func;
-    // stat(MOUNT_POINT"/update.bin", &st_func);
-
     err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
         fclose(update);
+        vTaskResume( mainTaskHandle );
         vTaskDelete(NULL);
     }
     ESP_LOGI(TAG, "esp_ota_begin succeeded");
     
+    // Check filesize to match read size later
+    struct stat st_func;
+    stat(MOUNT_POINT"/update.bin", &st_func);
     int data_read;
     int binary_file_length = 0;
     bool image_header_was_checked = false;
@@ -245,6 +270,7 @@ static void otaTask(void * parameter){
                             ESP_LOGW(TAG, "Previously, there was an attempt to launch the firmware with %s version, but it failed.", invalid_app_info.version);
                             ESP_LOGW(TAG, "The firmware has been rolled back to the previous version.");
                             fclose(update);
+                            vTaskResume( mainTaskHandle );
                             vTaskDelete(NULL);
                         }
                     }
@@ -252,6 +278,7 @@ static void otaTask(void * parameter){
                     if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0) {
                         ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
                         fclose(update);
+                        vTaskResume( mainTaskHandle );
                         vTaskDelete(NULL);
                     }
 #endif
@@ -261,6 +288,7 @@ static void otaTask(void * parameter){
                 } else {
                     ESP_LOGE(TAG, "received package is not fit len");
                     fclose(update);
+                    vTaskResume( mainTaskHandle );
                     vTaskDelete(NULL);
                 }
             }
@@ -268,14 +296,31 @@ static void otaTask(void * parameter){
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
                 fclose(update);
+                vTaskResume( mainTaskHandle );
                 vTaskDelete(NULL);
             } 
             binary_file_length += data_read;
             ESP_LOGI(TAG, "Written image length %d", binary_file_length);
         }
 
-    /* Keep looping till the whole file is sent */
-    } while (data_read != 0);
+    // Keep looping until the whole file is sent or if SD card is removed
+    } while (data_read != 0 && is_sd_present);
+
+    // Check if read size and original size are compatible
+    if (!is_sd_present){
+        ESP_LOGE(TAG, "SD Card removed! Aborting ...");
+        fclose(update);
+        vTaskResume( mainTaskHandle );
+        vTaskDelete(NULL);
+    }
+
+    // Check if read size and original size are compatible
+    if (binary_file_length != (int)st_func.st_size){
+        ESP_LOGE(TAG, "File not read successfully! Aborting ...");
+        fclose(update);
+        vTaskResume( mainTaskHandle );
+        vTaskDelete(NULL);
+    }
 
     err = esp_ota_end(update_handle);
     if (err != ESP_OK) {
@@ -291,6 +336,7 @@ static void otaTask(void * parameter){
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
         fclose(update);
+        vTaskResume( mainTaskHandle );
         vTaskDelete(NULL);
     }
 
@@ -307,108 +353,17 @@ static void otaTask(void * parameter){
     return ;
 }
 
-void app_main(void)
-{   
+static void sdhandleTask(void * parameter){
+    struct stat st_sd;
     gpio_config_t io_conf;
-
-    //interrupt of both edges
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
-    //bit mask of the CD pin
-    io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
-    //set as input mode    
-    io_conf.mode = GPIO_MODE_INPUT;
-    //enable pull-up mode
-    io_conf.pull_up_en = 1;
-    gpio_config(&io_conf);
-    gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
-    //install gpio isr service
-    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
-
-    int is_sd_card_mounted = false;
-    if(gpio_get_level(PIN_NUM_CD) == 0){
-        is_sd_present = true;
-        ESP_LOGI(TAG, "SD CARD FOUND!");
-        ESP_LOGI(TAG, "MOUNTING ...");
-        is_sd_card_mounted = start_sd_card();
-        // Readds the ISR routine (PIN reconfigured)
-        io_conf.intr_type = GPIO_INTR_ANYEDGE;
-        io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
-        //set as input mode    
-        io_conf.mode = GPIO_MODE_INPUT;
-        //enable pull-up mode
-        io_conf.pull_up_en = 1;
-        gpio_config(&io_conf);
-        gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
-        gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
-    }
-
-    //create a queue to handle gpio event from isr
-    gpio_evt_queue = xQueueCreate(1, sizeof(uint32_t));
-
-    //hook isr handler for specific gpio pin
-    gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
-
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
-             running->type, running->subtype, running->address);
-
-    esp_ota_img_states_t ota_state;
-
-    // if(sd_status){
-    //     ESP_LOGI(TAG, "SD CARD STARTED!");
-    //     // Look for binary update file in SD card named "update.bin"
-    //     struct stat st;
-    //     if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
-    //         // Log if it is found
-    //         ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
-    //         // Print its size in bytes
-    //         printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
-    //     } else {
-    //         // Log if it is not found
-    //         ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
-    //     }
-    // } else {
-    //     ESP_LOGE(TAG, "SD CARD FAILED!");
-    // }
-
-    struct stat st;
-    int cleanup_update = false;
-
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            // run diagnostic function ...
-            bool diagnostic_is_ok = true;
-            if (diagnostic_is_ok) {
-                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
-                esp_ota_mark_app_valid_cancel_rollback();
-                if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
-                    ESP_LOGI(TAG, "Removing previous update ...");
-                    cleanup_update = true;
-                }
-            } else {
-                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
-                esp_ota_mark_app_invalid_rollback_and_reboot();
-            } 
-        }
-    }
-
-    if(cleanup_update){
-        unlink(MOUNT_POINT"/update.bin");
-        ESP_LOGI(TAG, "Removing done!");
-        cleanup_update = false;
-    }
-
-    gpio_pad_select_gpio(BLINK_GPIO);
-    /* Set the GPIO as a push/pull output */
-    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
-
-    //xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
-    xTaskCreate(toggleLED, "toggleLED", 2048, NULL, 1, NULL);
-
     while (1){
         if(is_sd_present && !is_sd_card_mounted){
+            // If the SD card is present and has not been mounted, try to mount it
             ESP_LOGI(TAG, "SD CARD FOUND!");
             ESP_LOGI(TAG, "MOUNTING ...");
+            if(!is_spi_started){
+                start_spi_bus();
+            }
             is_sd_card_mounted = start_sd_card();
             // Readds the ISR routine (PIN reconfigured)
             io_conf.intr_type = GPIO_INTR_ANYEDGE;
@@ -421,23 +376,37 @@ void app_main(void)
             gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
             gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
         } else if (!is_sd_present && is_sd_card_mounted){
+            // If the SD card is removed and is still mounted, unmount it
             ESP_LOGE(TAG, "SD CARD REMOVED!");
             ESP_LOGE(TAG, "UNMOUNTING ...");
             esp_vfs_fat_sdcard_unmount(mount_point, card);
             ESP_LOGI(TAG, "Card unmounted");
+            is_sd_card_mounted = false;
 #ifdef USE_SPI_MODE
             //deinitialize the bus after all devices are removed
             spi_bus_free(host.slot);
+            is_spi_started = false;
 #endif
+             // Readds the ISR routine (PIN reconfigured)
+            io_conf.intr_type = GPIO_INTR_ANYEDGE;
+            io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
+            //set as input mode    
+            io_conf.mode = GPIO_MODE_INPUT;
+            //enable pull-up mode
+            io_conf.pull_up_en = 1;
+            gpio_config(&io_conf);
+            gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+            gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
         } else if(is_sd_present && is_sd_card_mounted){
-            if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
+            // If the SD card is present and mounted, look for update file
+            if (stat(MOUNT_POINT"/update.bin", &st_sd) == 0) {
                 // Log if it is found
                 ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
                 // Print its size in bytes
-                printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
+                printf("SIZE OF FILE: %lu\n", (unsigned long)st_sd.st_size);
                 ESP_LOGI(TAG, "STARTING UPDATE PROCESS ...");
-                xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
-                return;
+                xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, &otaTaskHandle);
+                vTaskSuspend( NULL );
             } else {
                 // Log if it is not found
                 ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
@@ -445,5 +414,146 @@ void app_main(void)
         }
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
+}
+
+void app_main(void)
+{   
+    // Configuration of GPIO pin to detect first insertion of SD card
+    gpio_config_t io_conf;
+    // Enable CD interrupt on both edges
+    // Rising edge  ---> Card removed
+    // Falling edge ---> Card inserted
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    // Bit mask of the Card Detection (CD) pin
+    io_conf.pin_bit_mask = (1ULL << PIN_NUM_CD);
+    // Set as input mode    
+    io_conf.mode = GPIO_MODE_INPUT;
+    // Enable pull-up mode
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+    // Extra pullup enable due to errors while testing
+    gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+
+    // Install GPIO ISR service
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+
+    // If card already present, try to mount
+    if(gpio_get_level(PIN_NUM_CD) == 0){
+        is_sd_present = true;
+        ESP_LOGI(TAG, "SD CARD FOUND!");
+        ESP_LOGI(TAG, "MOUNTING ...");
+        if(!is_spi_started){
+            start_spi_bus();
+        }
+        is_sd_card_mounted = start_sd_card();
+        ESP_LOGI(TAG, "REATACHING ISR ...");
+        // Readds the ISR routine (PIN reconfigured)
+        io_conf.intr_type = GPIO_INTR_ANYEDGE;
+        io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
+        //set as input mode    
+        io_conf.mode = GPIO_MODE_INPUT;
+        //enable pull-up mode
+        io_conf.pull_up_en = 1;
+        gpio_config(&io_conf);
+        gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+        gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
+    }
+
+    //gpio_set_intr_type(PIN_NUM_CD, GPIO_INTR_ANYEDGE);
+    // Adds ISR handler to detect SD card insertion/removal
+    gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
+
+    // Check running partition to check if OTA was performed correctly
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+             running->type, running->subtype, running->address);
+
+    // Check current OTA state to validate new image
+    esp_ota_img_states_t ota_state;
+    struct stat st;
+    int cleanup_update = false;
+
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+            // Test image to check if working properly
+            // TBD!!!!
+            bool diagnostic_is_ok = true;
+            if (diagnostic_is_ok) {
+                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
+                esp_ota_mark_app_valid_cancel_rollback();
+                if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
+                    // Set flag to perform cleanup outside OTA validity check
+                    cleanup_update = true;
+                }
+            } else {
+                // OTA Validity test failed, perform rollback to previous valid version
+                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            } 
+        }
+    }
+
+    // Perform cleanup in the SD card of firmware file just applied
+    if(cleanup_update){
+        unlink(MOUNT_POINT"/update.bin");
+        ESP_LOGI(TAG, "Removing done!");
+        cleanup_update = false;
+    }
+
+    // Select GPIO to blink LED
+    gpio_pad_select_gpio(BLINK_GPIO);
+    // Set GPIO to blink LED as output
+    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+    // Create blink LED task
+    //xTaskCreate(toggleLED, "toggleLED", 2048, NULL, 1, NULL);
+    xTaskCreate(sdhandleTask, "sdhandleTask", 8192, NULL, 1, &mainTaskHandle);
+    // Loop from the main task
+//     while (1){
+//         if(is_sd_present && !is_sd_card_mounted){
+//             // If the SD card is present and has not been mounted, try to mount it
+//             ESP_LOGI(TAG, "SD CARD FOUND!");
+//             ESP_LOGI(TAG, "MOUNTING ...");
+//             if(!is_spi_started){
+//                 start_spi_bus();
+//             }
+//             is_sd_card_mounted = start_sd_card();
+//             // Readds the ISR routine (PIN reconfigured)
+//             io_conf.intr_type = GPIO_INTR_ANYEDGE;
+//             io_conf.pin_bit_mask = (1ULL<<PIN_NUM_CD);
+//             //set as input mode    
+//             io_conf.mode = GPIO_MODE_INPUT;
+//             //enable pull-up mode
+//             io_conf.pull_up_en = 1;
+//             gpio_config(&io_conf);
+//             gpio_set_pull_mode(PIN_NUM_CD, GPIO_PULLUP_ONLY);
+//             gpio_isr_handler_add(PIN_NUM_CD, gpio_isr_handler, (void*) PIN_NUM_CD);
+//         } else if (!is_sd_present && is_sd_card_mounted){
+//             // If the SD card is removed and is still mounted, unmount it
+//             ESP_LOGE(TAG, "SD CARD REMOVED!");
+//             ESP_LOGE(TAG, "UNMOUNTING ...");
+//             esp_vfs_fat_sdcard_unmount(mount_point, card);
+//             ESP_LOGI(TAG, "Card unmounted");
+//             is_sd_card_mounted = false;
+// #ifdef USE_SPI_MODE
+//             //deinitialize the bus after all devices are removed
+//             spi_bus_free(host.slot);
+//             is_spi_started = false;
+// #endif
+//         } else if(is_sd_present && is_sd_card_mounted){
+//             // If the SD card is present and mounted, look for update file
+//             if (stat(MOUNT_POINT"/update.bin", &st) == 0) {
+//                 // Log if it is found
+//                 ESP_LOGI(TAG, "UPDATE FILE FOUND!!");
+//                 // Print its size in bytes
+//                 printf("SIZE OF FILE: %lu\n", (unsigned long)st.st_size);
+//                 ESP_LOGI(TAG, "STARTING UPDATE PROCESS ...");
+//                 xTaskCreate(otaTask, "otaTask", 8192, NULL, 5, NULL);
+//             } else {
+//                 // Log if it is not found
+//                 ESP_LOGE(TAG, "NO UPDATE FILE FOUND!");
+//             }
+//         }
+//         vTaskDelay(500 / portTICK_PERIOD_MS);
+//     }
     
 }
