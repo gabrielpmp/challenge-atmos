@@ -1,11 +1,4 @@
-ESP-IDF template app
+Current app - v1.0.1
 ====================
 
-This is a template application to be used with [Espressif IoT Development Framework](https://github.com/espressif/esp-idf).
-
-Please check [ESP-IDF docs](https://docs.espressif.com/projects/esp-idf/en/latest/get-started/index.html) for getting started instructions.
-
-*Code in this repository is in the Public Domain (or CC0 licensed, at your option.)
-Unless required by applicable law or agreed to in writing, this
-software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-CONDITIONS OF ANY KIND, either express or implied.*
+Esta pasta contém a versão corrente do app sobre o qual será aplicado um update via cartão SD, nomeado *update.bin* no root do cartão. O app é responsável por monitorar a inserção de um cartão SD válido e realizar a sua montagem para leitura de arquivos. Uma vez corretamente montado, o app procura o arquivo *update.bin* para realizar o processo OTA de atualização de firmware. Caso encontrado, verifica sua integridade e se a versão é maior que a atual. Nesse caso, faz a leitura do arquivo binário de atualização para a partição OTA disponível. Após a conclusão, desmonta o cartão SD e reinicia o dispositivo com a nova partição de boot configurada. O aplicativo mantém todos os LEDs da placa apagados.
