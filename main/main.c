@@ -30,13 +30,6 @@ static const char *TAG = "example";
 #define BUFFSIZE 1024
 static char ota_write_data[BUFFSIZE + 1] = { 0 };
 
-// Global definitions to enable SD card to be accessible
-// in multiple scopes
-#define MOUNT_POINT "/sdcard"
-const char mount_point[] = MOUNT_POINT;
-sdmmc_card_t* card;
-sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-
 // Controll flags
 volatile int is_sd_present = false;
 // Flag to detect SD card mounting status
@@ -46,7 +39,20 @@ bool is_spi_started = false;
 // Flag to prevent repeated application of update on Write Protected cards
 int is_ota_already_done = false;
 
-#define USE_SPI_MODE
+// Firmware tested using SPI mode, but using 1-Line SDMMC for final version
+// To use SPI mode, uncomment line bellow
+// #define USE_SPI_MODE
+
+// Global definitions to enable SD card to be accessible
+// in multiple function scopes
+#define MOUNT_POINT "/sdcard"
+const char mount_point[] = MOUNT_POINT;
+sdmmc_card_t* card;
+#ifndef USE_SPI_MODE
+sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+#else
+sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+#endif //USE_SPI_MODE
 
 // DMA channel to be used by the SPI peripheral
 #ifndef SPI_DMA_CHAN
@@ -80,10 +86,12 @@ static void IRAM_ATTR gpio_isr_handler(void* arg){
     is_sd_present = !gpio_get_level(gpio_num);
 }
 
+#ifdef USE_SPI_MODE
 void start_spi_bus(){
     esp_err_t ret;
     // Reduce default speed due to peripheral limitations
-    host.max_freq_khz = 8000;
+    // Uncomment and set as needed
+    // host.max_freq_khz = 8000;
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = PIN_NUM_MOSI,
         .miso_io_num = PIN_NUM_MISO,
@@ -100,6 +108,7 @@ void start_spi_bus(){
     is_spi_started = true;
     return;
 }
+#endif
 
 int start_sd_card(){
     esp_err_t ret;
@@ -120,23 +129,25 @@ int start_sd_card(){
 
 #ifndef USE_SPI_MODE
     ESP_LOGI(TAG, "Using SDMMC peripheral");
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 
     // This initializes the slot without card detect (CD) and write protect (WP) signals.
-    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    // Signals treated separately in order to avoid GPIO initialization overwriting
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
 
-    // To use 1-line SD mode, uncomment the following line:
-    // slot_config.width = 1;
+    // Using 1-line SD mode, setting width:
+    slot_config.width = 1;
 
     // GPIOs 15, 2, 4, 12, 13 should have external 10k pull-ups.
     // Internal pull-ups are not sufficient. However, enabling internal pull-ups
     // does make a difference some boards, so we do that here.
-    gpio_set_pull_mode(15, GPIO_PULLUP_ONLY);   // CMD, needed in 4- and 1- line modes
-    gpio_set_pull_mode(2, GPIO_PULLUP_ONLY);    // D0, needed in 4- and 1-line modes
-    gpio_set_pull_mode(4, GPIO_PULLUP_ONLY);    // D1, needed in 4-line mode only
-    gpio_set_pull_mode(12, GPIO_PULLUP_ONLY);   // D2, needed in 4-line mode only
-    gpio_set_pull_mode(13, GPIO_PULLUP_ONLY);   // D3, needed in 4- and 1-line modes
+    // Using default values from IDF SD card example
+    // Please, setup pins if using a different configuration!!!
+    gpio_set_pull_mode(15, GPIO_PULLUP_ONLY);     // CMD, needed in 4- and 1-line modes
+    gpio_set_pull_mode(2, GPIO_PULLUP_ONLY);      // D0, needed in 4- and 1-line modes
+    // Pins not needed in 1-line mode
+    // gpio_set_pull_mode(4, GPIO_PULLUP_ONLY);   // D1, needed in 4-line mode only
+    // gpio_set_pull_mode(12, GPIO_PULLUP_ONLY);  // D2, needed in 4-line mode only
+    gpio_set_pull_mode(13, GPIO_PULLUP_ONLY);     // D3, needed in 4- and 1-line modes
 
     ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
 #else
@@ -366,16 +377,19 @@ static void sdHandleTask(void * parameter){
             // If the SD card is present and has not been mounted, try to mount it
             ESP_LOGI(TAG, "SD CARD FOUND!");
             ESP_LOGI(TAG, "MOUNTING ...");
+#ifdef USE_SPI_MODE
+            // Initialize the SPI bus to use devices
             if(!is_spi_started){
                 start_spi_bus();
             }
+#endif
             is_sd_card_mounted = start_sd_card();
         } else if (!is_sd_present && is_sd_card_mounted){
             // If the SD card is removed and is still mounted, unmount it
             ESP_LOGE(TAG, "SD CARD REMOVED!");
             ESP_LOGE(TAG, "UNMOUNTING ...");
             esp_vfs_fat_sdcard_unmount(mount_point, card);
-            ESP_LOGI(TAG, "Card unmounted");
+            ESP_LOGI(TAG, "CARD UNMOUNTED");
             is_sd_card_mounted = false;
 #ifdef USE_SPI_MODE
             // Deinitialize the SPI bus after all devices are removed
@@ -432,9 +446,12 @@ void app_main(void)
         is_sd_present = true;
         ESP_LOGI(TAG, "SD CARD FOUND!");
         ESP_LOGI(TAG, "MOUNTING ...");
+#ifdef USE_SPI_MODE
+        // Initialize the SPI bus to use devices
         if(!is_spi_started){
             start_spi_bus();
         }
+#endif
         is_sd_card_mounted = start_sd_card();
     }
 
