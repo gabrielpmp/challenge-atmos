@@ -1,9 +1,9 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <sys/unistd.h>
-#include <sys/stat.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -13,8 +13,6 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "sdmmc_cmd.h"
-#include "nvs.h"
-#include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "sdkconfig.h"
 
@@ -75,7 +73,6 @@ int is_ota_already_done = false;
 // Pin definitions
 #define BLINK_GPIO   2
 #define DIAGNOSTICS_BUTTON_GPIO  4
-#define CONFIG_EXAMPLE_SKIP_VERSION_CHECK
 
 // ISR for detecting SD card insertion/removal
 static void IRAM_ATTR gpio_isr_handler(void* arg){
@@ -284,6 +281,7 @@ static void otaTask(void * parameter){
 #ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
                     if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0) {
                         ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
+                        is_ota_already_done = true;
                         fclose(update);
                         vTaskResume(sdTaskHandle);
                         vTaskDelete(NULL);
@@ -461,7 +459,7 @@ void app_main(void)
             if (diagnostic_is_ok) {
                 ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
                 esp_ota_mark_app_valid_cancel_rollback();
-                if (gpio_get_level(PIN_NUM_WP) == 0) {
+                if (gpio_get_level(PIN_NUM_WP) == 1) {
                     ESP_LOGE(TAG, "SD card is write protected! Cannot erase file ...");
                     // Set flag to prevent redetection of previously applied update
                     is_ota_already_done = true;
